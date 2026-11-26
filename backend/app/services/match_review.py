@@ -9,6 +9,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.match_confirmation import (
+    confirmation_lock,
+    find_match_by_reference,
+    review_approval_receipt,
+    write_match_confirmation,
+)
 from app.store import store
 
 
@@ -29,46 +35,61 @@ class MatchReviewService(BaseModuleService):
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": f"{self.ENTITY} {entry_id} 不存在"}
-        if entry.get("status") != "待复核":
-            return {"ok": False, "message": "记录不处于待复核状态"}
-        match_id = str(entry.get("匹配记录", "") or "")
-        match = next(
-            (m for m in store.rows("sku_match") if str(m.get("id", "")) == match_id), None
-        )
-        if match is not None:
-            match["status"] = "已匹配"
-            match["pending"] = False
-        entry["status"] = "已通过"
-        entry["复核角色"] = reviewer
-        entry["复核时间"] = datetime.now(timezone.utc).isoformat()
-        entry["pending"] = False
-        return {"ok": True, "message": "复核已通过", "match_backfilled": match is not None}
+
+        match_ref = str(entry.get("匹配记录", "") or "")
+        with confirmation_lock(reference=match_ref):
+            if entry.get("status") != "待复核":
+                return {"ok": False, "message": "记录不处于待复核状态"}
+
+            match = find_match_by_reference(match_ref)
+            handled_at = datetime.now(timezone.utc).isoformat()
+            write_result = write_match_confirmation(
+                match,
+                approved=True,
+                source="match_review",
+                reviewer=reviewer,
+                review_id=entry.get("id"),
+                review_code=entry.get("记录编号"),
+                review_conclusion=entry.get("复核结论"),
+                confirmed_at=handled_at,
+            )
+            receipt = write_result.get("receipt") or {}
+
+            entry["status"] = "已通过"
+            # 崩溃恢复后的继续请求不得覆盖首次确认时留下的审核人和时间。
+            entry["复核角色"] = receipt.get("reviewer") or reviewer
+            entry["复核时间"] = receipt.get("confirmed_at") or handled_at
+            entry["pending"] = False
+            return review_approval_receipt(write_result)
 
     def reject(self, entry_id: int, reviewer: str) -> dict[str, Any]:
         """驳回复核记录，样本回流失败隔离区。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "复核记录不存在"}
-        if entry.get("status") != "待复核":
-            return {"ok": False, "message": "记录不处于待复核状态"}
-        entry["status"] = "已驳回"
-        entry["复核角色"] = reviewer
-        entry["复核时间"] = datetime.now(timezone.utc).isoformat()
-        entry["abnormal"] = True
-        rows = store.rows("failure_quarantine")
-        fid = max((int(r.get("id", 0)) for r in rows), default=0) + 1
-        rows.append({
-            "id": fid,
-            "样本指纹": f"review-{entry_id}",
-            "失败阶段": "匹配",
-            "失败原因": f"复核驳回: {entry.get('复核结论', '')}",
-            "隔离时间": datetime.now(timezone.utc).isoformat(),
-            "重试次数": "0",
-            "status": "待处理",
-            "pending": True,
-            "abnormal": False,
-        })
-        return {"ok": True, "message": "复核已驳回，样本回流隔离区", "quarantine_id": fid}
+
+        match_ref = str(entry.get("匹配记录", "") or "")
+        with confirmation_lock(reference=match_ref):
+            if entry.get("status") != "待复核":
+                return {"ok": False, "message": "记录不处于待复核状态"}
+            entry["status"] = "已驳回"
+            entry["复核角色"] = reviewer
+            entry["复核时间"] = datetime.now(timezone.utc).isoformat()
+            entry["abnormal"] = True
+            rows = store.rows("failure_quarantine")
+            fid = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+            rows.append({
+                "id": fid,
+                "样本指纹": f"review-{entry_id}",
+                "失败阶段": "匹配",
+                "失败原因": f"复核驳回: {entry.get('复核结论', '')}",
+                "隔离时间": datetime.now(timezone.utc).isoformat(),
+                "重试次数": "0",
+                "status": "待处理",
+                "pending": True,
+                "abnormal": False,
+            })
+            return {"ok": True, "message": "复核已驳回，样本回流隔离区", "quarantine_id": fid}
 
     def claim_task(self, entry_id: int, role: str) -> dict[str, Any]:
         """按角色认领待复核记录，校验角色范围。"""
